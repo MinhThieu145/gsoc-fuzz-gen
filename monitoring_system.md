@@ -1,470 +1,720 @@
 ## 1. Current Workflow Summary
 
-The current workflow for monitoring fuzz target generation and execution in OSS-Fuzz-Gen operates as follows:
+The current OSS-Fuzz-Gen system tracks fuzzing jobs in two different ways, depending on where the job runs: locally or in the cloud.
 
-1. **Status Tracking**: The system uses JSON files to store status information for each submission, tracking stages, progress, and messages. This is handled by the `WorkDirs` class:
+### 1.1 Local Job Tracking
+
+For jobs that run on the local machine:
+
+1. **Directory Setup**: First, a working directory is created for each job:
 
 ```python
 # From experiment/workdir.py
 class WorkDirs:
-    """Working directories."""
-    RUN_LOG_NAME_PATTERN = re.compile(r'.*-F(\d+).log')
-
     def __init__(self, base_dir, keep: bool = False):
         self._base_dir = os.path.realpath(base_dir)
-        if os.path.exists(self._base_dir) and not keep:
-            # Clear existing directory.
-            rmtree(self._base_dir, ignore_errors=True)
-
-        os.makedirs(self._base_dir, exist_ok=True)
+        # Create various directories including status
         os.makedirs(self.status, exist_ok=True)
-        os.makedirs(self.raw_targets, exist_ok=True)
-        os.makedirs(self.fixed_targets, exist_ok=True)
-        os.makedirs(self.build_logs, exist_ok=True)
-        os.makedirs(self.run_logs, exist_ok=True)
-        os.makedirs(self._corpus_base, exist_ok=True)
-        os.makedirs(self.dills, exist_ok=True)
-        os.makedirs(self.fuzz_targets, exist_ok=True)
+        # ...other directories...
+    
+    @property
+    def status(self):
+        return os.path.join(self._base_dir, 'status')
 ```
 
-2. **Result Management**: Results are stored in structured classes that capture different aspects of the fuzzing process:
+2. **Status Files**: The system creates JSON files in the status directory to track progress:
 
 ```python
-# From results.py
-class RunResult(BuildResult):
-    """The fuzzing run-time result info."""
-    crashes: bool
-    run_error: str
-    run_log: str
-    coverage_summary: dict
-    coverage: float
-    line_coverage_diff: float
-    reproducer_path: str
-    textcov_diff: Optional[textcov.Textcov]
-    log_path: str
-    corpus_path: str
-    coverage_report_path: str
-    cov_pcs: int
-    total_pcs: int
+# From pipeline.py
+def _update_status(self, result_history: list[Result]) -> None:
+    trial_result = TrialResult(benchmark=result_history[-1].benchmark,
+                           trial=self.trial,
+                           work_dirs=result_history[-1].work_dirs,
+                           result_history=result_history)
+    # Write to status file
+    self.logger.write_result(
+        result_status_dir=trial_result.best_result.work_dirs.status,
+        result=trial_result)
 ```
 
-3. **Execution Stages**: The system uses a pipeline of stages that handle different aspects of fuzzing:
+3. **Progress Updates**: Each stage of the pipeline updates these status files:
 
 ```python
-# From stage/execution_stage.py
-class ExecutionStage(BaseStage):
-    """Executes fuzz targets and build scripts."""
-    def execute(self, result_history: list[Result]) -> Result:
-        """Executes the fuzz target and build script in the latest result."""
-        last_result = result_history[-1]
-        benchmark = last_result.benchmark
-        if self.args.cloud_experiment_name:
-            builder_runner = builder_runner_lib.CloudBuilderRunner(
-                benchmark=benchmark,
-                work_dirs=last_result.work_dirs,
-                run_timeout=self.args.run_timeout,
-                experiment_name=self.args.cloud_experiment_name,
-                experiment_bucket=self.args.cloud_experiment_bucket,
-            )
-        else:
-            builder_runner = builder_runner_lib.BuilderRunner(
-                benchmark=benchmark,
-                work_dirs=last_result.work_dirs,
-                run_timeout=self.args.run_timeout,
-            )
+# From pipeline.py
+def _execute_one_cycle(self, result_history: list[Result], cycle_count: int) -> None:
+    # Run Writing Stage
+    result_history.append(
+        self.writing_stage.execute(result_history=result_history))
+    self._update_status(result_history=result_history)  # Update status after writing
+    
+    # Skip remaining stages if build failed
+    if (not isinstance(result_history[-1], BuildResult) or 
+        not result_history[-1].success):
+        self.logger.warning('Build failure, skipping remaining steps')
+        return
+
+    # Run Execution Stage
+    result_history.append(
+        self.execution_stage.execute(result_history=result_history))
+    self._update_status(result_history=result_history)  # Update status after execution
+    
+    # Skip analysis if execution failed
+    if (not isinstance(result_history[-1], RunResult) or 
+        not result_history[-1].log_path):
+        self.logger.warning('Run failure, skipping analysis')
+        return
+
+    # Run Analysis Stage
+    result_history.append(
+        self.analysis_stage.execute(result_history=result_history))
+    self._update_status(result_history=result_history)  # Update status after analysis
 ```
 
-4. **Cloud Execution**: The system supports both local and cloud-based execution through the `CloudBuilderRunner` class:
+4. **Status Checking**: To check status, you need to read these files from disk:
+
+```python
+# From module_for_researcher/define_and_submit_custom_fuzz_targets/status.py
+def get_status(submission_id, submissions_dir):
+    status_file = os.path.join(submissions_dir, submission_id, 'status.json')
+    if os.path.exists(status_file):
+        with open(status_file, 'r') as f:
+            return json.load(f)
+    # ...handle other cases...
+```
+
+### 1.2 Cloud Job Tracking
+
+For jobs that run in Google Cloud:
+
+1. **Job Submission**: When a cloud job starts, it gets a unique ID and paths in Google Cloud Storage:
 
 ```python
 # From experiment/builder_runner.py
-class CloudBuilderRunner(BuilderRunner):
-    """Cloud BuilderRunner."""
-    def __init__(self, *args, experiment_name: str, experiment_bucket: str, **kwargs):
-        self.experiment_name = experiment_name
-        self.experiment_bucket = experiment_bucket
-        super().__init__(*args, **kwargs)
-
-    def build_and_run_cloud(self, generated_project: str, target_path: str,
-                          iteration: int, build_result: BuildResult,
-                          language: str, cloud_build_tags: Optional[list[str]] = None,
-                          trial: int = 0) -> tuple[BuildResult, Optional[RunResult]]:
-        """Builds and runs the fuzz target in the cloud."""
+def build_and_run_cloud(self, generated_project, target_path, ...):
+    # Generate unique ID
+    uid = self.experiment_name + str(uuid.uuid4())
+    
+    # Set up storage paths in Google Cloud
+    run_log_path = f'gs://{self.experiment_bucket}/{uid}.run.log'
+    build_log_path = f'gs://{self.experiment_bucket}/{uid}.build.log'
+    
+    # Submit to Google Cloud Build
+    command = [
+        # Command to run the fuzzing job
+    ]
 ```
 
-This workflow provides basic status tracking but lacks real-time updates, proper error handling, and a clean API interface.
+2. **Blocking Execution**: The code waits for the cloud job to complete:
+
+```python
+# From experiment/builder_runner.py
+def build_and_run_cloud(self, generated_project, target_path, ...):
+    # ...setup code...
+    
+    # Wait for job to complete (blocking)
+    result = self._run_with_retry_control(target_path, ...)
+    
+    # After completion, download results
+    # ...download code...
+```
+
+3. **Results Retrieval**: Once the job finishes, results are downloaded from cloud storage:
+
+```python
+# From experiment/builder_runner.py
+def build_and_run_cloud(self, generated_project, target_path, ...):
+    # ...job execution...
+    
+    # Download results
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(self.experiment_bucket)
+    
+    # Download logs, corpus, coverage data
+    with open(run_log_path, 'wb') as f:
+        blob = bucket.blob(run_log_name)
+        if blob.exists():
+            blob.download_to_file(f)
+```
+
+### 1.3 Key Differences Between Local and Cloud Tracking
+
+There are two major differences in how local and cloud jobs are tracked:
+
+1. **Blocking vs. Non-blocking**:
+   - **Local jobs** update status files throughout execution - you can check progress at any time
+   - **Cloud jobs** block until completion - there's no way to check partial progress
+
+2. **Storage Location**:
+   - **Local jobs** store status and results in local files
+   - **Cloud jobs** store logs and results in Google Cloud Storage, only downloading them after completion
+
+These differences make it hard to monitor cloud jobs effectively, since you can't check their status until they finish. The current system doesn't provide a unified way to track both types of jobs.
 
 ## 2. New Monitoring System Design
 
-The new monitoring system will enhance the current workflow with the following improvements:
+The current monitoring system has different problems depending on whether we're running jobs locally or in the cloud. Let's look at what we could fix for each one.
 
-1. **Real-time Status Updates**: Users can receive live updates about their fuzzing submissions through WebSocket connections.
-2. **Enhanced Error Handling**: The system will provide detailed error information and recovery mechanisms.
-3. **Clean API Interface**: A RESTful API will make it easy to monitor and manage fuzzing submissions.
-4. **Improved Status Management**: Better organization and cleanup of status files with versioning support.
+### For Local Jobs
 
-## 3. New Workflow with Function Signatures
+Our current local job monitoring is pretty basic - we just write status to files. Here are some ideas to make it better:
 
-### Step 1: Initialize the Monitoring System
+1. **Historical Status Tracking**: We could keep old versions of status files, kind of like Git does with commits. This would let us see how a job progressed over time.
+
+   But honestly, I feel like this isn't a great idea. It would use up disk space for not much benefit. Plus, implementing this right would be more complicated than it's worth.
+
+2. **Simpler Status Format**: Right now our status files contain a lot of nested data that's hard to parse. We could simplify this to make it easier to read and process (as I notice we expand and write upon the status file as we proceed)
+
+### For Cloud Jobs
+
+Cloud job monitoring has bigger problems that actually need fixing:
+
+**Non-blocking Status Checks**: Currently, our code just waits for cloud jobs to finish. Instead, we should:
+   - Submit the job to Google Cloud Build
+   - Return immediately with the cloud job ID
+   - Provide a way to check status later using that ID
+
+
+
+## 3. New Workflow
+
+The new monitoring system needs to handle two different types of fuzzing jobs:
+- **Local jobs** that run on the same machine
+- **Cloud jobs** that run on Google Cloud Build
+
+The workflow for each is different, so I'll split them up below.
+
+### 3.1 Shared Setup Functions
+
+#### Initialize Monitoring System
 
 ```python
 def initialize_monitoring(base_dir: str) -> MonitoringSystem:
-    """Creates and initializes the monitoring system.
-    
-    Args:
-        base_dir: Base directory for storing monitoring data
-        
-    Returns:
-        Initialized monitoring system instance
-    """
+    """Creates and initializes the monitoring system."""
 ```
 
-**Core Logic:**
-- Set up monitoring directories and files
-- Initialize status tracking system
-- Configure WebSocket server
-- Set up API endpoints
+This function sets up everything needed for monitoring:
+- Creates directories for storing monitoring data
+- Sets up a simple database for tracking jobs
+- Prepares logging configuration
 
-### Step 2: Create Submission Status
+### 3.2 Local Job Workflow
+
+Local jobs run directly on the machine and write status files during execution.
+
+#### 1. Submit Local Job
 
 ```python
-def create_submission_status(
-    submission_id: str,
+def submit_local_job(
     project: str,
-    function: Dict[str, Any]
-) -> Dict[str, Any]:
-    """Creates a new submission status entry.
+    function: Dict[str, Any],
+    options: Dict[str, Any] = None
+) -> str:
+    """Submits a local fuzzing job.
     
-    Args:
-        submission_id: Unique identifier for the submission
-        project: Name of the OSS-Fuzz project
-        function: Dictionary containing function details
-        
     Returns:
-        Initial status information
+        submission_id to track the job
     """
 ```
 
-**Core Logic:**
-- Generate unique submission ID
-- Create status directory structure
-- Initialize status file with metadata
-- Set up WebSocket connection
+This function:
+- Generates a unique submission ID
+- Creates working directories
+- Initializes the status file
+- Starts the fuzzing pipeline in the current process
 
-### Step 3: Update Submission Status
+#### 2. Update Local Status
 
 ```python
-def update_submission_status(
+def update_local_status(
     submission_id: str,
     stage: str,
     progress: float,
-    message: Optional[str] = None,
+    message: str = None,
     state: str = 'running'
 ) -> Dict[str, Any]:
-    """Updates the status of a submission.
+    """Updates the status of a local job."""
+```
+
+This function:
+- Writes the new status to the job's status file
+- Called automatically by the pipeline after each stage
+
+#### 3. Get Local Results
+
+```python
+def get_local_job_results(submission_id: str) -> Dict[str, Any]:
+    """Gets results for a completed local job."""
+```
+
+This function:
+- Reads the final status and result files
+- Returns coverage, crashes, and other metrics
+
+### 3.3 Cloud Job Workflow
+
+Cloud jobs run on Google Cloud Build and need special handling to check status.
+
+#### 1. Submit Cloud Job
+
+```python
+def submit_cloud_job(
+    project: str,
+    function: Dict[str, Any],
+    options: Dict[str, Any] = None
+) -> str:
+    """Submits a job to Google Cloud Build without waiting.
     
-    Args:
-        submission_id: The submission ID
-        stage: Current stage of processing
-        progress: Progress percentage (0.0 to 1.0)
-        message: Optional status message
-        state: Current state (running, completed, error)
-        
     Returns:
-        Updated status information
+        submission_id to track the job
     """
 ```
 
-**Core Logic:**
-- Update status file with new information
-- Broadcast update to connected clients
-- Maintain status history
-- Handle state transitions
+This function:
+- Generates a unique submission ID
+- Creates Google Cloud Storage paths for logs and results
+- **Submits the job using the --async flag so it returns immediately**
+- Stores the Cloud Build ID for later status checking
+- Returns the submission ID without waiting for the job to complete
 
-### Step 4: Get Submission Status
+#### 2. Check Cloud Job Status
 
 ```python
-def get_submission_status(submission_id: str) -> Dict[str, Any]:
-    """Retrieves the current status of a submission.
-    
-    Args:
-        submission_id: The submission ID
-        
-    Returns:
-        Current status information
-    """
+def check_cloud_job_status(submission_id: str) -> Dict[str, Any]:
+    """Checks current status of a cloud job without blocking."""
 ```
 
-**Core Logic:**
-- Read status file
-- Format status information
-- Include relevant metadata
-- Handle missing submissions
+This function:
+- Looks up the Cloud Build ID associated with this submission
+- Calls the Google Cloud Build API to check current status
+- Translates Cloud Build status to our format
+- Returns status without waiting for job completion
 
-### Step 5: Get Submission Results
+#### 3. Get Cloud Job Results
 
 ```python
-def get_submission_results(submission_id: str) -> Dict[str, Any]:
-    """Retrieves the results of a completed submission.
-    
-    Args:
-        submission_id: The submission ID
-        
-    Returns:
-        Submission results including coverage and crash data
-    """
+def get_cloud_job_results(submission_id: str) -> Dict[str, Any]:
+    """Downloads and processes results from a completed cloud job."""
 ```
 
-**Core Logic:**
-- Check submission completion
-- Read result files
-- Format result data
-- Include error information if any
+This function:
+- Checks if the cloud job is complete
+- Downloads logs and artifacts from Google Cloud Storage
+- Processes the results into the same format as local jobs
+- Returns coverage, crashes, and other metrics
 
-### Step 6: Handle Submission Error
+### 3.4 Unified Interface
+
+These functions work for both local and cloud jobs by automatically detecting the job type.
+
+#### Get Job Status
 
 ```python
-def handle_submission_error(
+def get_job_status(submission_id: str) -> Dict[str, Any]:
+    """Gets status for any job (local or cloud)."""
+```
+
+This function:
+- Determines if the job is local or cloud-based
+- For local jobs: reads the status file
+- For cloud jobs: calls check_cloud_job_status()
+- Returns a consistent status format either way
+
+#### Get Job Results
+
+```python
+def get_job_results(submission_id: str) -> Dict[str, Any]:
+    """Gets results for any completed job (local or cloud)."""
+```
+
+This function:
+- Determines if the job is local or cloud-based
+- For local jobs: calls get_local_job_results()
+- For cloud jobs: calls get_cloud_job_results()
+- Returns a consistent results format either way
+
+#### Handle Error
+
+```python
+def handle_job_error(
     submission_id: str,
     error: Exception,
     stage: str
 ) -> Dict[str, Any]:
-    """Handles errors during submission processing.
+    """Handles errors for any job (local or cloud)."""
+```
+
+This function:
+- Records error details in the status system
+- For cloud jobs: might attempt to cancel the cloud job
+- Updates status to indicate failure
+
+### 3.5 Key Differences in Implementation
+
+The main differences between local and cloud monitoring are:
+
+1. **Job Submission**
+   - Local: Runs in same process, blocking until complete
+   - Cloud: Submits with --async flag, returns immediately
+
+2. **Status Checking**
+   - Local: Read directly from status files
+   - Cloud: Query Google Cloud Build API for current status
+
+3. **Result Collection**
+   - Local: Available directly in local files
+   - Cloud: Must be downloaded from Google Cloud Storage
+
+This approach gives us non-blocking cloud job monitoring while maintaining a consistent interface for users.
+
+## 3.1 Monitoring System Flow Diagram
+
+Here's how data flows through our monitoring system:
+
+```
+[OssFuzzApi] → creates → [Unique Submission ID]
+                            ↓
+[WorkDirs] → creates → [Directory Structure] 
+                           ↓
+                      [status.json] ← updated by ← [update_status()]
+                           ↓
+                  accessed by Pipeline
+                           ↓
+      ┌──────────┬─────────┴──────────┐
+      ↓          ↓                    ↓
+[Writing Stage] [Execution Stage] [Analysis Stage]
+      ↓          ↓                    ↓
+  [Results]   [Results]            [Results]
+      └──────────┴─────────┬──────────┘
+                           ↓
+                  [Pipeline._update_status()]
+                           ↓
+                     [Logger.write_result()]
+                           ↓
+                      [status.json]
+                           ↓
+         accessed by [get_status()] & [get_submission_results()]
+                           ↓
+                     [OssFuzzApi] → returns to → [User]
+```
+
+This diagram shows how everything connects. Think of status files as the central hub of information - they let different parts of the system talk to each other without waiting for each other to finish. The submission ID works like a tracking number that follows your fuzzing job through the entire process.
+
+## 3.2 What's in the Status Files: A Stage-by-Stage Look
+
+Let's look at what information gets stored at each step of the process, along with the actual code that makes it happen.
+
+### 3.2.1 Starting a Fuzzing Job
+
+When someone submits a new fuzzing job, we create the first status file:
+
+```python
+# From module_for_researcher/define_and_submit_custom_fuzz_targets/api.py
+def create_fuzz_target(self, project, function, options=None):
+    # Generate a unique ID for tracking
+    submission_id = str(uuid.uuid4())
+    submission_dir = os.path.join(self.submissions_dir, submission_id)
+    os.makedirs(submission_dir, exist_ok=True)
     
-    Args:
-        submission_id: The submission ID
-        error: The exception that occurred
-        stage: The stage where the error occurred
-        
-    Returns:
-        Updated status with error information
-    """
-```
-
-**Core Logic:**
-- Record error details
-- Update submission status
-- Attempt recovery if possible
-- Notify connected clients
-
-### Step 7: Clean Up Submission
-
-```python
-def cleanup_submission(submission_id: str) -> bool:
-    """Cleans up submission data and resources.
+    # Create the first status update
+    update_status(
+        submission_id=submission_id,
+        submissions_dir=self.submissions_dir,
+        stage='starting',
+        progress=0.1,
+        message='Setting up benchmark'
+    )
     
-    Args:
-        submission_id: The submission ID
+    # ...rest of function...
+```
+
+This creates a status file that looks like:
+
+```json
+{
+  "submission_id": "550e8400-e29b-41d4-a716-446655440000",
+  "stage": "starting",
+  "progress": 0.1,
+  "last_update": 1680123456.789,
+  "message": "Setting up benchmark",
+  "state": "running"
+}
+```
+
+This tells us that the system has received the job and is starting to work on it.
+
+### 3.2.2 Writing Stage: Generating Fuzz Target Code
+
+The Writing Stage uses an LLM to create the fuzz target. After it's done:
+
+```python
+# From stage/writing_stage.py
+class WritingStage(BaseStage):
+    def execute(self, result_history: list[Result]) -> Result:
+        # Generate fuzz target code
+        last_result = result_history[-1]
         
-    Returns:
-        True if cleanup successful, False otherwise
-    """
-```
-
-**Core Logic:**
-- Close WebSocket connections
-- Archive status files
-- Clean up temporary files
-- Update submission history
-
-## 4. Cloud Integration for Monitoring System
-
-The current OSS-Fuzz-Gen system supports both local and cloud-based execution of fuzzing jobs. This section explains how cloud integration works and how the monitoring system can be extended to support cloud-based fuzzing.
-
-### 4.1 Current Cloud Workflow
-
-In the current system, cloud-based fuzzing operates as follows:
-
-1. **Job Preparation**: When a user submits a fuzzing job with cloud execution enabled, the system creates a unique identifier and prepares the necessary files:
-
-```python
-# From experiment/builder_runner.py
-class CloudBuilderRunner(BuilderRunner):
-    """Cloud BuilderRunner."""
-    def __init__(self, *args, experiment_name: str, experiment_bucket: str, **kwargs):
-        self.experiment_name = experiment_name
-        self.experiment_bucket = experiment_bucket
-        super().__init__(*args, **kwargs)
-
-    def build_and_run_cloud(self, generated_project: str, target_path: str,
-                          iteration: int, build_result: BuildResult,
-                          language: str, cloud_build_tags: Optional[list[str]] = None,
-                          trial: int = 0) -> tuple[BuildResult, Optional[RunResult]]:
-        """Builds and runs the fuzz target in the cloud."""
-        uid = self.experiment_name + str(uuid.uuid4())
-        run_log_name = f'{uid}.run.log'
-        run_log_path = f'gs://{self.experiment_bucket}/{run_log_name}'
-        build_log_name = f'{uid}.build.log'
-        build_log_path = f'gs://{self.experiment_bucket}/{build_log_name}'
-```
-
-2. **Cloud Storage Setup**: The system sets up paths in Google Cloud Storage (GCS) for storing job artifacts:
-
-```python
-# From experiment/builder_runner.py
-        corpus_name = f'{uid}.corpus.zip'
-        corpus_path = f'gs://{self.experiment_bucket}/{corpus_name}'
-        coverage_name = f'{uid}.coverage'
-        coverage_path = f'gs://{self.experiment_bucket}/{coverage_name}'
-        reproducer_name = f'{uid}.reproducer'
-        reproducer_path = f'gs://{self.experiment_bucket}/{reproducer_name}'
-```
-
-3. **Job Submission**: The job is submitted to Google Cloud Build with specific parameters:
-
-```python
-# From experiment/builder_runner.py
-        command = [
-            f'./{oss_fuzz_checkout.VENV_DIR}/bin/python3',
-            'infra/build/functions/target_experiment.py',
-            f'--project={generated_project}',
-            f'--target={self.benchmark.target_name}',
-            f'--upload_build_log={build_log_path}',
-            f'--upload_output_log={run_log_path}',
-            f'--upload_coverage={coverage_path}',
-            f'--upload_reproducer={reproducer_path}',
-            f'--upload_corpus={corpus_path}',
-            f'--experiment_name={self.experiment_name}',
-            f'--real_project={project_name}',
-        ]
-```
-
-4. **Error Handling**: The system includes a retry mechanism for cloud-specific errors:
-
-```python
-# From experiment/builder_runner.py
-    @staticmethod
-    def _run_with_retry_control(target_path: str, *args, **kwargs) -> bool:
-        """sp.run() with controllable retry and customized exponential backoff."""
-        retryable_errors = [
-            ('RESOURCE_EXHAUSTED', lambda x: 5 * 2**x + random.randint(50, 90)),
-            ('BrokenPipeError: [Errno 32] Broken pipe',
-             lambda x: 5 * 2**x + random.randint(1, 5)),
-            ('Service Unavailable', lambda x: 5 * 2**x + random.randint(1, 5)),
-            ('You do not currently have an active account selected',
-             lambda x: 5 * 2**x),
-            ('gcloud crashed (OSError): unexpected end of data', lambda x: 5 * 2**x),
-        ]
-```
-
-5. **Result Collection**: Once the job completes, the system retrieves artifacts from GCS:
-
-```python
-# From experiment/builder_runner.py
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(self.experiment_bucket)
+        # Use agent to generate code
+        fuzz_target_code = self.agent.generate_fuzz_target(last_result.benchmark)
+        build_script_code = self.agent.generate_build_script(last_result.benchmark)
         
-        # Download build logs
-        with open(self.work_dirs.build_logs_target(generated_target_name, iteration), 'wb') as f:
-            blob = bucket.blob(build_log_name)
-            if blob.exists():
-                blob.download_to_file(f)
-                
-        # Download run logs
-        with open(run_log_path, 'wb') as f:
-            blob = bucket.blob(run_log_name)
-            if blob.exists():
-                build_result.succeeded = True
-                blob.download_to_file(f)
+        # Create a build result with the generated code
+        build_result = BuildResult(
+            benchmark=last_result.benchmark,
+            trial=self.trial,
+            work_dirs=last_result.work_dirs,
+            fuzz_target_source=fuzz_target_code,
+            build_script_source=build_script_code,
+            author=self,
+            chat_history=last_result.chat_history,
+        )
+        
+        return build_result
 ```
 
-### 4.2 Integration with Monitoring System
-
-To extend our monitoring system for cloud support, we need to address several key challenges:
-
-#### 4.2.1 Cloud Job Tracking
+After this, the pipeline updates the status:
 
 ```python
-def track_cloud_job(submission_id: str, cloud_job_id: str) -> None:
-    """
-    Associates a submission with its cloud job ID and sets up tracking.
-    """
+# From pipeline.py
+def _execute_one_cycle(self, result_history, cycle_count):
+    # Run Writing Stage
+    result_history.append(
+        self.writing_stage.execute(result_history=result_history))
+    self._update_status(result_history=result_history)  # Update status file
 ```
 
-**Logic Explanation**:
-- Creates a mapping between submission ID and cloud job ID
-- Stores mapping in a persistent database or file
-- Sets up initial metadata about the cloud job
+The status file now shows:
 
-#### 4.2.2 Cloud Status Polling
+```json
+{
+  "submission_id": "550e8400-e29b-41d4-a716-446655440000",
+  "stage": "writing_complete",
+  "progress": 0.3,
+  "last_update": 1680123466.789,
+  "message": "Fuzz target code generated",
+  "state": "running",
+  "fuzz_target_source": "// Generated code...",
+  "build_script_source": "// Build script code..."
+}
+```
+
+Now we have the generated code saved in our status.
+
+### 3.2.3 Execution Stage: Building and Running the Fuzzer
+
+The Execution Stage tries to build and run the fuzz target:
 
 ```python
-def get_cloud_job_status(cloud_job_id: str) -> Dict[str, Any]:
-    """
-    Checks the status of a cloud job and returns formatted status information.
-    """
+# From stage/execution_stage.py
+class ExecutionStage(BaseStage):
+  def execute(self, result_history: list[Result]) -> Result:
+    last_result = result_history[-1]
+    benchmark = last_result.benchmark
+    
+    # Set up the builder (local or cloud)
+    builder_runner = builder_runner_lib.BuilderRunner(
+        benchmark=benchmark,
+        work_dirs=last_result.work_dirs,
+        run_timeout=self.args.run_timeout,
+    )
+
+    # Run the fuzzer and get results
+    try:
+      build_result, run_result = builder_runner.build_and_run(
+          generated_oss_fuzz_project,
+          fuzz_target_path,
+          0,
+          benchmark.language)
+      
+      # Package results into a RunResult
+      runresult = RunResult(
+          benchmark=benchmark,
+          trial=last_result.trial,
+          compiles=last_result.compiles,
+          crashes=run_result.crashes,
+          coverage=coverage_percent,
+          log_path=run_result.log_path,
+          corpus_path=run_result.corpus_path,
+          # ...other fields...
+      )
+    except Exception as e:
+      # Handle errors
+      self.logger.error('Exception %s occurred on %s', e, last_result)
+      runresult = RunResult(
+          # Minimal error result
+      )
+
+    return runresult
 ```
 
-**Logic Explanation**:
-- Contacts Google Cloud Build API to check job status
-- Translates cloud-specific status codes to our monitoring system's format
-- Handles API errors with retries and backoff
-
-#### 4.2.3 Cloud Artifact Management
+Again, the pipeline updates the status:
 
 ```python
-def list_cloud_artifacts(submission_id: str) -> Dict[str, str]:
-    """
-    Lists all artifacts stored in Google Cloud Storage for a submission.
-    """
+# Update status after execution stage
+result_history.append(
+    self.execution_stage.execute(result_history=result_history))
+self._update_status(result_history=result_history)
 ```
 
-**Logic Explanation**:
-- Queries GCS to list all artifacts for a specific submission
-- Organizes artifacts by type (logs, corpus, coverage)
-- Provides URLs or paths to access each artifact
+Now the status shows execution results:
+
+```json
+{
+  "submission_id": "550e8400-e29b-41d4-a716-446655440000",
+  "stage": "execution_complete",
+  "progress": 0.7,
+  "last_update": 1680123566.789,
+  "message": "Fuzzing executed with 75% coverage",
+  "state": "running",
+  "build_result": {
+    "compiles": true,
+    "binary_exists": true,
+    "is_function_referenced": true
+  },
+  "run_result": {
+    "crashes": false,
+    "coverage": 0.75,
+    "cov_pcs": 150,
+    "total_pcs": 200,
+    "log_path": "/path/to/logs/run.log",
+    "corpus_path": "/path/to/corpus"
+  }
+}
+```
+
+This tells us if the code worked, how much of the target function was covered, and if any crashes were found.
+
+### 3.2.4 Analysis Stage: Understanding the Results
+
+The Analysis Stage looks at how well the fuzzer performed:
 
 ```python
-def retrieve_cloud_artifact(artifact_path: str, destination: str) -> bool:
-    """
-    Downloads a specific artifact from Google Cloud Storage.
-    """
+# From stage/analysis_stage.py
+class AnalysisStage(BaseStage):
+  def execute(self, result_history: list[Result]) -> Result:
+    last_result = result_history[-1]
+    
+    # Analyze the results
+    semantic_result = self._check_semantic(last_result)
+    
+    if last_result.crashes:
+      # Analyze crashes
+      crash_result = self._analyze_crash(last_result)
+    else:
+      crash_result = None
+      
+    if last_result.coverage < COVERAGE_THRESHOLD:
+      # Analyze low coverage
+      coverage_result = self._analyze_coverage(last_result)
+    else:
+      coverage_result = None
+    
+    # Create analysis result
+    analysis_result = AnalysisResult(
+        author=self,
+        run_result=last_result,
+        semantic_result=semantic_result,
+        crash_result=crash_result,
+        coverage_result=coverage_result,
+    )
+    
+    return analysis_result
 ```
 
-**Logic Explanation**:
-- Downloads a specific artifact from GCS to a local path
-- Handles large file downloads with appropriate chunking
-- Implements retries for network failures
-
-#### 4.2.4 Unified Status Reporting
+And the pipeline updates the status again:
 
 ```python
-def get_unified_submission_status(submission_id: str) -> Dict[str, Any]:
-    """
-    Provides a unified view of submission status, whether local or cloud-based.
-    """
+# Update status after analysis
+result_history.append(
+    self.analysis_stage.execute(result_history=result_history))
+self._update_status(result_history=result_history)
 ```
 
-**Logic Explanation**:
-- Checks if the submission is a cloud job
-- Queries cloud status if applicable
-- Presents a consistent status format regardless of execution environment
-- Includes environment-specific details when available
+The status now includes analysis insights:
 
-### 4.3 Challenges and Considerations
+```json
+{
+  "submission_id": "550e8400-e29b-41d4-a716-446655440000",
+  "stage": "analysis_complete",
+  "progress": 0.9,
+  "last_update": 1680123666.789,
+  "message": "Analysis complete - coverage 75%, no crashes",
+  "state": "running",
+  "analysis_result": {
+    "success": true,
+    "recommendations": "Try adding more edge cases to improve coverage",
+    "suggested_improvements": [
+      "Add null input tests",
+      "Test boundary conditions"
+    ]
+  }
+}
+```
 
-Several challenges need to be addressed when integrating cloud support:
+This gives feedback about how the fuzz target could be improved.
 
-1. **Asynchronous Nature**: Cloud jobs run asynchronously and may take hours to complete. The monitoring system must handle this without keeping connections open.
+### 3.2.5 Job Complete: Final Results
 
-2. **Network Reliability**: Communication with cloud services can be interrupted. All cloud operations need robust error handling and retry logic.
+When all cycles are finished (either we hit the limit or achieved great results):
 
-3. **Status Translation**: Cloud services use their own status terminology and error codes that must be translated to our system's format.
+```python
+# From pipeline.py
+def _terminate(self, result_history: list[Result], cycle_count: int) -> bool:
+    # Check if we've reached termination conditions
+    if cycle_count > 5:
+      self.logger.info('[Cycle %d] Terminate after 5 cycles: %s', cycle_count,
+                       result_history)
+      return True
 
-4. **Large Data Handling**: Corpus files and coverage data can be very large. The system needs efficient strategies for transferring and processing this data.
+    last_result = result_history[-1]
+    if isinstance(last_result, AnalysisResult) and last_result.success:
+      self.logger.info('[Cycle %d] Generation succeeds: %s', cycle_count,
+                       result_history)
+      return True
+      
+    # ...other termination conditions...
+    
+    return False
+```
 
-5. **Cost Management**: Frequent polling of cloud services and data transfers can incur costs. The system should implement strategies to minimize these costs.
+The final status looks like:
 
-### 4.4 Future Implementation Plan
+```json
+{
+  "submission_id": "550e8400-e29b-41d4-a716-446655440000",
+  "stage": "completed",
+  "progress": 1.0,
+  "last_update": 1680123766.789,
+  "message": "Fuzzing complete with 82% final coverage",
+  "state": "completed",
+  "final_results": {
+    "cycles_completed": 3,
+    "best_coverage": 0.82,
+    "crashes_found": 0,
+    "best_result_cycle": 3,
+    "total_execution_time": 310.5
+  }
+}
+```
 
-The implementation of cloud integration would follow these phases:
+This summary shows the final outcome of all our fuzzing efforts.
 
-1. **Cloud Status Mapping**: Define a clear mapping between cloud service statuses and our system's status format.
+## 3.3 The Glue That Holds It All Together
 
-2. **Basic Cloud Monitoring**: Implement basic status checking for cloud jobs without artifact retrieval.
+Five key parts connect everything in our monitoring system:
 
-3. **Artifact Management**: Add capabilities to list and download artifacts from cloud storage.
+1. **Submission ID**: Works like a tracking number that follows each job through the entire process.
 
-4. **Full Integration**: Incorporate cloud status into the unified monitoring system.
+```python
+# From api.py
+submission_id = str(uuid.uuid4())  # Generate unique ID
+```
 
-This approach allows for gradual implementation while still providing useful functionality at each phase. The monitoring system API would remain consistent, with the underlying implementation handling the complexity of cloud interaction.
+2. **Status Files**: Store all the information about a job's progress where any part of the system can find it.
+
+```python
+# From status.py
+def update_status(submission_id, submissions_dir, stage, progress, message, state='running'):
+    status_file = os.path.join(submissions_dir, submission_id, 'status.json')
+    with open(status_file, 'w') as f:
+        json.dump(status, f, indent=2)
+```
