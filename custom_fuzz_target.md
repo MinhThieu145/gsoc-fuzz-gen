@@ -215,7 +215,7 @@ To build this API, we'll need to:
 
 ## Core Encapsulated Function for Fuzz Target Execution
 
-The new workflow includes an encapsulated function that handles the complete process of building and running fuzz targets. This function takes a generated fuzz target, build script, and project name as inputs, executes all necessary steps, and returns comprehensive results.
+The new workflow requires a standalone function in a new file (e.g., `executor.py`) that handles the complete process of building and running fuzz targets. This function will serve as the execution engine for generated fuzz targets.
 
 ```python
 def run_fuzz_target(
@@ -242,30 +242,38 @@ def run_fuzz_target(
     """
 ```
 
-### Function Design
-
-The function follows a clear workflow with these key components:
+### Function Design Details
 
 1. **Project Environment Setup**
-   - Create a copy of the OSS-Fuzz project
-   - Set up necessary directories and files
-   - Configure build environment
+   - Clone the OSS-Fuzz repository using `oss_fuzz_checkout.clone_oss_fuzz()` from `experiment/oss_fuzz_checkout.py`
+   - Create a copy of the project directory from `OSS_FUZZ_DIR/projects/{project_name}` to a temporary location
+   - Set up output directories for build artifacts, logs, and corpus using a structure similar to `WorkDirs` in `experiment/workdir.py`
 
 2. **Fuzz Target Integration**
-   - Write fuzz target code to the project directory
-   - Install build script with proper permissions
-   - Connect to project's build system
+   - Write fuzz target code to `{project_dir}/{target_name}.c` (or appropriate extension based on language)
+   - Create build script at `{project_dir}/build.sh` with executable permissions
+   - Modify the project's Dockerfile to include the new target using techniques from `experiment/evaluator.py:create_ossfuzz_project()`
 
 3. **Execution Management**
-   - Create appropriate BuilderRunner (local or cloud)
-   - Configure benchmark and working directories
-   - Handle build and execution with retry logic
+   - Create a BuilderRunner instance from `experiment/builder_runner.py`:
+     - `BuilderRunner` for local execution
+     - `CloudBuilderRunner` for cloud execution
+   - Build and run the target with retry logic similar to `experiment/evaluator.py:check_target()`
+   - Handle transient failures (network issues, resource limits) by retrying failed operations
 
 4. **Result Collection**
-   - Gather build success/failure information
-   - Collect coverage metrics (lines covered, percentage)
-   - Record any crashes and their details
-   - Organize output artifacts (logs, reports)
+   - Gather build results from the `BuildResult` object returned by the builder
+   - Extract coverage data using techniques from `experiment/evaluator.py` and `experiment/textcov.py`
+   - Check for crashes in the fuzzer output logs
+   - Collect all artifacts into a standardized directory structure for easy access
+
+### Integration with Existing Code
+
+The function should leverage these existing components:
+- Project setup code from `experiment/oss_fuzz_checkout.py`
+- Build and run processes from `experiment/builder_runner.py`
+- Result collection from `experiment/evaluator.py`
+- Coverage analysis from `experiment/textcov.py`
 
 ### Return Value Structure
 
@@ -291,14 +299,3 @@ The function follows a clear workflow with these key components:
     "corpus_path": str
 }
 ```
-
-### Integration Points
-
-This function integrates with several existing components:
-
-- **BuilderRunner**: Handles container creation and execution
-- **Benchmark**: Configures the build and run parameters
-- **WorkDirs**: Manages directory structure for artifacts
-- **OSS-Fuzz**: Leverages existing infrastructure for build/fuzzing
-
-This encapsulated function serves as the execution engine for the custom fuzz target workflow.
